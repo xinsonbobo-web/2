@@ -1,0 +1,118 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unpack source zip
+        run: |
+          if [ -f racepick-ios.zip ]; then unzip -o racepick-ios.zip; fi
+          find . -path ./.git -prune -o -type f -print | sort
+
+      - name: Show Xcode
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate app icon
+        run: |
+          ICON=RacePick/Assets.xcassets/AppIcon.appiconset/AppIcon.png
+          swift ci/make_icon.swift "$ICON" || python3 ci/make_icon_fallback.py "$ICON"
+          ls -l "$ICON"
+
+      - name: Guard against committed secrets
+        run: |
+          if git ls-files | grep -E '(^|/)\.typesafe_key$'; then
+            echo "::error::.typesafe_key must never be committed"; exit 1
+          fi
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned, Release, iOS)
+        run: |
+          mkdir -p build
+          set +e
+          xcodebuild \
+            -project RacePick.xcodeproj \
+            -scheme RacePick \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            clean build > build/xcodebuild.log 2>&1
+          STATUS=$?
+          set -e
+          echo "xcodebuild exit status: $STATUS"
+          grep -E "error:|\*\* BUILD" build/xcodebuild.log | sort -u | head -120 || true
+          if [ "$STATUS" != "0" ]; then tail -60 build/xcodebuild.log; fi
+          exit $STATUS
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: build/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Package IPA
+        run: |
+          APP="build/DerivedData/Build/Products/Release-iphoneos/RacePick.app"
+          test -d "$APP"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APP/Info.plist"
+          ls "$APP"
+          rm -rf Payload RacePick.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry RacePick.ipa Payload
+          ls -lh RacePick.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RacePick-ipa
+          path: RacePick.ipa
+          if-no-files-found: error
+
+      - name: Move "latest" tag to this commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f latest
+          git push -f origin refs/tags/latest
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: RacePick（開跑推薦）最新版
+          body: |
+            未簽名 IPA，用 Sideloadly 以自己嘅 Apple ID 簽名安裝。
+            Commit: ${{ github.sha }}
+            直接下載：https://github.com/${{ github.repository }}/releases/download/latest/RacePick.ipa
+          files: RacePick.ipa
+          make_latest: true
+          overwrite_files: true
