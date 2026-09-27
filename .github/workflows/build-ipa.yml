@@ -58,9 +58,12 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build/DerivedData \
-            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_ALLOWED=YES \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="-" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
             clean build > build/xcodebuild.log 2>&1
           STATUS=$?
           set -e
@@ -84,7 +87,6 @@ jobs:
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APP/Info.plist"
           ls "$APP"
-          codesign --force --sign - --timestamp=none --generate-entitlement-der "$APP"
           codesign -dv "$APP" 2>&1 | head -5
           ls "$APP/_CodeSignature"
           rm -rf Payload RacePick.ipa
