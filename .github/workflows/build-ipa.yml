@@ -84,6 +84,9 @@ jobs:
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APP/Info.plist"
           ls "$APP"
+          codesign --force --sign - --timestamp=none --generate-entitlement-der "$APP"
+          codesign -dv "$APP" 2>&1 | head -5
+          ls "$APP/_CodeSignature"
           rm -rf Payload RacePick.ipa
           mkdir Payload
           cp -R "$APP" Payload/
