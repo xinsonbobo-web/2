@@ -1,0 +1,145 @@
+name: Build VBank IPA
+
+# 只喺 VBank 嘅檔案有改動先 build；只會更新 `vbank` release，唔會郁其他 tag。
+on:
+  push:
+    branches: [main]
+    paths:
+      - vbank-ios.zip
+      - .github/workflows/build-vbank-ipa.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-vbank-ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      PROJ_DIR: vbank-ios
+      APP_NAME: VBank
+      IPA_NAME: VBank.ipa
+      RELEASE_TAG: vbank
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unpack source zip
+        run: |
+          test -f vbank-ios.zip || { echo "::error::vbank-ios.zip not found at repo root"; exit 1; }
+          rm -rf "$PROJ_DIR"
+          unzip -q -o vbank-ios.zip        # creates vbank-ios/
+          test -f "$PROJ_DIR/project.yml"
+          find "$PROJ_DIR" -type f -print | sort
+
+      - name: Show Xcode
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Guard against secrets in the bundle
+        working-directory: ${{ env.PROJ_DIR }}
+        run: |
+          if find . -name '*.key' -o -name '.env' -o -name '*.pem' -o -name '*.p12' -o -name '*.mobileprovision' | grep .; then
+            echo "::error::Secret-looking file found in vbank-ios.zip"; exit 1
+          fi
+
+      - name: Generate Xcode project
+        working-directory: ${{ env.PROJ_DIR }}
+        run: xcodegen generate
+
+      - name: Build (unsigned, Release, iOS)
+        working-directory: ${{ env.PROJ_DIR }}
+        run: |
+          mkdir -p build
+          set +e
+          xcodebuild \
+            -project "$APP_NAME.xcodeproj" \
+            -scheme "$APP_NAME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            ENABLE_DEBUG_DYLIB=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS=arm64 \
+            clean build > build/xcodebuild.log 2>&1
+          STATUS=$?
+          set -e
+          echo "xcodebuild exit status: $STATUS"
+          grep -E "error:|warning: .*Swift|\*\* BUILD" build/xcodebuild.log | sort -u | head -120 || true
+          if [ "$STATUS" != "0" ]; then tail -80 build/xcodebuild.log; fi
+          exit $STATUS
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vbank-xcodebuild-log
+          path: vbank-ios/build/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Sign (ad-hoc) and package IPA
+        working-directory: ${{ env.PROJ_DIR }}
+        run: |
+          APP="build/DerivedData/Build/Products/Release-iphoneos/$APP_NAME.app"
+          test -d "$APP"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist"
+          lipo -info "$APP/$APP_NAME"
+          # 唔應該有任何內嵌 framework / dylib；有就列出嚟（每個都要簽）
+          find "$APP" \( -name '*.dylib' -o -name '*.framework' -o -name '*.appex' \) -print
+          # 清走 Finder / quarantine 等 extended attributes（codesign 會因為佢哋 fail 或者簽出唔一致嘅結果）
+          xattr -cr "$APP"
+          # 內嵌嘅嘢（如有）先簽，最後簽 app 本身；唔加 entitlements，由 Sideloadly 用你嘅 Apple ID 重簽時加返
+          find "$APP" -depth \( -name '*.dylib' -o -name '*.framework' -o -name '*.appex' \) -print0 \
+            | xargs -0 -I{} codesign --force --sign - --timestamp=none "{}"
+          codesign --force --sign - --timestamp=none "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv --verbose=2 "$APP" 2>&1 | head -12
+          rm -rf Payload "$IPA_NAME"
+          mkdir Payload
+          ditto "$APP" "Payload/$APP_NAME.app"
+          zip -qr -X "$IPA_NAME" Payload
+          unzip -l "$IPA_NAME" | tail -3
+          mv "$IPA_NAME" "$GITHUB_WORKSPACE/$IPA_NAME"
+          ls -lh "$GITHUB_WORKSPACE/$IPA_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VBank-ipa
+          path: VBank.ipa
+          if-no-files-found: error
+
+      - name: Move "vbank" tag to this commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "$RELEASE_TAG"
+          git push -f origin "refs/tags/$RELEASE_TAG"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vbank
+          name: VBank 虛擬倉 最新版（只模擬，唔會真落注）
+          body: |
+            Ad-hoc 簽名 IPA。用 Sideloadly（Signing Mode 揀「Apple ID Sideload」）以自己嘅 Apple ID 重新簽名安裝。
+            Commit: ${{ github.sha }}
+            直接下載：https://github.com/${{ github.repository }}/releases/download/vbank/VBank.ipa
+          files: VBank.ipa
+          make_latest: false
+          overwrite_files: true
